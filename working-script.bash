@@ -1,30 +1,88 @@
 #!/bin/bash
-# Smart MongoDB Certificate Renewal Script
-# Only restarts MongoDB if ALL replica set members are healthy
-
 set -euo pipefail
 
+# Smart MongoDB Certificate Renewal Script
+# Only restarts MongoDB if ALL replica set members are healthy
+#
+# Usage: ./script.sh [OPTIONS]
+#
+# Options:
+#   -c PATH    Certificate file (default: /etc/ssl/mongodb/mongodb-cert.pem)
+#   -b PATH    Backup directory (default: /etc/ssl/mongodb/backups)
+#   -l PATH    logs file (default: /var/log/mongodb/certificate-renewal.log)
+#   -d PATH    domain certificate renewed (REQUIRED)
+#   -q         Quiet mode (suppress non-essential output)
+#
+# Environment variables:
+#   MONGO_USER         MongoDB username (REQUIRED)
+#   MONGO_PASSWORD     MongoDB password  (REQUIRED)
+#   MONGO_AUTH_DB      MongoDB authentication database (REQUIRED)
+
+# Parse opts beforehand
+CERT_FILE_ARG=""
+BACKUP_DIR_ARG=""
+LOG_FILE_ARG=""
+RENEWED_DOMAIN_ARG=""
+QUIET=false
+while getopts "c:b:l:d:q" opt; do
+    case $opt in
+        c)
+            CERT_FILE_ARG="$OPTARG"
+            ;;
+        b)
+            BACKUP_DIR_ARG="$OPTARG"
+            ;;
+        d)
+            RENEWED_DOMAIN_ARG="$OPTARG"
+            ;;
+        q)
+            QUIET=true
+            ;;
+        l)
+            LOG_FILE_ARG="$OPTARG"
+            ;;
+        \?)
+            die "Invalid option: -$OPTARG. Use -h for help."
+            ;;
+        :)
+            die "Option -$OPTARG requires an argument. Use -h for help."
+            ;;
+    esac
+done
+
 # Configuration
-readonly MONGO_USER="${MONGO_USER:-admin}"
+readonly MONGO_USER="${MONGO_USER:-}"
 readonly MONGO_PASSWORD="${MONGO_PASSWORD:-}"
-readonly MONGO_AUTH_DB="${MONGO_AUTH_DB:-admin}"
-readonly LOG_FILE="/var/log/mongodb/certificate-renewal.log"
-readonly CERT_NAME="${CERT_NAME:-}"
-readonly CERT_FILE="/etc/ssl/mongodb/${CERT_NAME:-mongodb-cert}.pem"
-readonly BACKUP_DIR="/etc/ssl/mongodb/backups"
-
-
+readonly MONGO_AUTH_DB="${MONGO_AUTH_DB:-}"
+readonly RENEWED_DOMAIN="${RENEWED_DOMAIN_ARG:-}"
+readonly LOG_FILE="${LOG_FILE_ARG:-"/var/log/mongodb/certificate-renewal.log"}"
+readonly CERT_FILE="${CERT_FILE_ARG:-"/etc/ssl/mongodb/mongodb-cert.pem"}"
+readonly BACKUP_DIR="${BACKUP_DIR_ARG:-"/etc/ssl/mongodb/backups"}"
 # MongoDB connection command
-readonly MONGO_CMD="mongosh -u \"$MONGO_USER\" -p \"$MONGO_PASSWORD\" \
-    --authenticationDatabase \"$MONGO_AUTH_DB\" \
-    --quiet --tls --tlsAllowInvalidHostnames"
+readonly MONGO_CMD=(
+    mongosh
+    -u "$MONGO_USER"
+    -p "$MONGO_PASSWORD"
+    --authenticationDatabase "$MONGO_AUTH_DB"
+    --quiet
+    --tls
+    --tlsAllowInvalidHostnames
+)
 
-# Ensure directories exist
-mkdir -p "$(dirname "$LOG_FILE")"
-mkdir -p "$BACKUP_DIR"
+prepare_environment(){
+    # Ensure directories exist
+    mkdir -p "$(dirname "$LOG_FILE")"
+    mkdir -p "$BACKUP_DIR"
+}
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE" >&2
+    local message
+    message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$message" >> "$LOG_FILE"
+    # Only write to stderr if not in quiet mode
+    if [[ "$QUIET" != "true" ]]; then
+        echo "$message" >&2
+    fi
 }
 
 die() {
@@ -32,12 +90,15 @@ die() {
     exit 1
 }
 
-validate_password() {
+validate_required_variables() {
+    [[ -n "$MONGO_AUTH_DB" ]] || die "MongoDB auth db not provided. Set MONGO_AUTH_DB environment variable."
+    [[ -n "$MONGO_USER" ]] || die "MongoDB user not provided. Set MONGO_USER environment variable."
     [[ -n "$MONGO_PASSWORD" ]] || die "MongoDB password not provided. Set MONGO_PASSWORD environment variable."
+    [[ -n "$RENEWED_DOMAIN" ]] || die "Renewed domain not provided. Set -d opt."
 }
 
-test_connection() {
-    if $MONGO_CMD --eval 'db.runCommand("ping")' &>/dev/null; then
+validate_connection() {
+    if "${MONGO_CMD[@]}" --eval 'db.runCommand("ping")' &>/dev/null; then
         log "✓ MongoDB connection successful"
         return 0
     else
@@ -45,9 +106,10 @@ test_connection() {
     fi
 }
 
-get_hostname() {
+# Gets the domain/hostname of the current mongo node
+get_current_mongo_node_domain() {
     local hostname
-    hostname=$($MONGO_CMD --eval "
+    hostname=$("${MONGO_CMD[@]}" --eval "
         try {
             const me = rs.status().members.find(m => m.self === true);
             print(me ? me.name.split(':')[0] : 'error');
@@ -64,7 +126,7 @@ check_and_prepare_replica_set() {
     log "Checking replica set health..."
     
     local result
-    result=$($MONGO_CMD --eval "
+    result=$("${MONGO_CMD[@]}" --eval "
         try {
             const status = rs.status();
             const members = status.members;
@@ -106,7 +168,7 @@ update_certificate() {
     
     local hostname="$1"
     local cert_source="/etc/letsencrypt/live/$hostname"
-    
+
     # Validate source certificate exists
     if [[ ! -f "$cert_source/fullchain.pem" ]] || [[ ! -f "$cert_source/privkey.pem" ]]; then
         die "Let's Encrypt certificates not found for $hostname"
@@ -127,8 +189,10 @@ update_certificate() {
     fi
     
     # Validate that the certificate and private key match
-    local cert_pubkey=$(openssl x509 -in "$cert_source/fullchain.pem" -pubkey -noout 2>/dev/null)
-    local key_pubkey=$(openssl pkey -in "$cert_source/privkey.pem" -pubout 2>/dev/null)
+    local cert_pubkey key_pubkey
+
+    cert_pubkey=$(openssl x509 -in "$cert_source/fullchain.pem" -pubkey -noout 2>/dev/null)
+    key_pubkey=$(openssl pkey -in "$cert_source/privkey.pem" -pubout 2>/dev/null)
     
     if [[ "$cert_pubkey" != "$key_pubkey" ]]; then
         die "Certificate and private key do not match"
@@ -138,7 +202,8 @@ update_certificate() {
     
     # Now that everything is validated, create backup of existing certificate
     if [[ -f "$CERT_FILE" ]]; then
-        local backup_filename="$(basename "$CERT_FILE").backup.$(date +%Y%m%d_%H%M%S)"
+        local backup_filename
+        backup_filename="$(basename "$CERT_FILE").backup.$(date +%Y%m%d_%H%M%S)"
         local backup_file="$BACKUP_DIR/$backup_filename"
         log "Creating backup of existing certificate: $backup_file"
         cp "$CERT_FILE" "$backup_file"
@@ -185,7 +250,7 @@ restart_mongodb() {
         local max_attempts=30
         
         while [ $attempts -lt $max_attempts ]; do
-            if $MONGO_CMD --eval 'db.runCommand("ping")' &>/dev/null; then
+            if "${MONGO_CMD[@]}" --eval 'db.runCommand("ping")' &>/dev/null; then
                 log "✓ MongoDB is ready and accepting connections"
                 return 0
             fi
@@ -242,32 +307,32 @@ validate_and_proceed() {
 }
 
 main() {
-    log "CONFIG -> Backups location: $BACKUP_DIR"
-    log "CONFIG -> Certificate location: $CERT_FILE"
-    log "CONFIG -> Certificate name: $CERT_NAME"
-    log "CONFIG -> Logs location: $LOG_FILE"
-
+    log "CONFIG -> Backups directory location: $BACKUP_DIR"
+    log "CONFIG -> Certificate file location: $CERT_FILE"
+    log "CONFIG -> Logs file location: $LOG_FILE"
     log "Starting MongoDB certificate renewal process"
     
     # Validate prerequisites
-    validate_password
-    test_connection
+    validate_required_variables
+    validate_connection
     
     # Get current hostname
-    local hostname
-    hostname=$(get_hostname)
-    log "Detected hostname: $hostname"
+    local current_domain
+    current_domain=$(get_current_mongo_node_domain)
+    log "Detected current node domain: $current_domain"
+
+    if [[ "$current_domain" != "$RENEWED_DOMAIN" ]]; then
+        die "Renewed domain $RENEWED_DOMAIN is not the domain of the current node with domain $current_domain"
+    fi
     
     # Check replica set health and prepare for restart
     local health_status
     health_status=$(check_and_prepare_replica_set)
     
-    # Store hostname globally for certificate update
-    HOSTNAME="$hostname"
     validate_and_proceed "$health_status"
     log "✓ All replicas healthy - ready to proceed with certificate renewal"
 
-    update_certificate "$HOSTNAME"
+    update_certificate "$current_domain"
 
     # Restart MongoDB now that it's safe
     restart_mongodb
