@@ -11,8 +11,7 @@ services:
       - "./certs:/output-certs"
       - "./backups:/backups"
       - "./letsencrypt:/etc/letsencrypt"
-    ports:
-      - "80:80"
+    network_mode: "host"
     command: renew --cert-name "$DOMAIN" --standalone
 
   certbot-obtain:
