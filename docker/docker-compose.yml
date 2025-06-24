@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile.renew
     environment:
-      - DOMAIN=XXXXX
+      - DOMAIN=${DOMAIN}    
     volumes:
       - "./certs:/output-certs"
       - "./backups:/backups"
@@ -20,7 +20,7 @@ services:
       context: .
       dockerfile: Dockerfile.obtain
     environment:
-      - DOMAIN=XXXXX
+      - DOMAIN=${DOMAIN}
     volumes:
       - "./certs:/output-certs"
       - "./letsencrypt:/etc/letsencrypt"
