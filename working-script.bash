@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Smart MongoDB Certificate Renewal Script
+# MongoDB Certificate Renewal Script
 # Only restarts MongoDB if ALL replica set members are healthy
 #
 # Usage: ./script.sh [OPTIONS]
@@ -42,10 +42,10 @@ while getopts "c:b:l:d:q" opt; do
             LOG_FILE_ARG="$OPTARG"
             ;;
         \?)
-            die "Invalid option: -$OPTARG. Use -h for help."
+            die "Invalid option: -$OPTARG"
             ;;
         :)
-            die "Option -$OPTARG requires an argument. Use -h for help."
+            die "Option -$OPTARG requires an argument."
             ;;
     esac
 done
@@ -79,9 +79,9 @@ log() {
     local message
     message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
     echo "$message" >> "$LOG_FILE"
-    # Only write to stderr if not in quiet mode
+
     if [[ "$QUIET" != "true" ]]; then
-        echo "$message" >&2
+        echo "$message"
     fi
 }
 
@@ -122,7 +122,7 @@ get_current_mongo_node_domain() {
     echo "$hostname"
 }
 
-check_and_prepare_replica_set() {
+check_status_and_stepdown_if_primary() {
     log "Checking replica set health..."
     
     local result
@@ -174,25 +174,42 @@ update_certificate() {
         die "Let's Encrypt certificates not found for $hostname"
     fi
     
-    # FIRST: Validate the source certificates are valid BEFORE doing anything
+    # Validate the source certificates are valid BEFORE doing anything
     log "Validating source Let's Encrypt certificates..."
     
     # Validate fullchain.pem
-    if ! openssl x509 -in "$cert_source/fullchain.pem" -text -noout >/dev/null 2>&1; then
+    local cert_validation_error
+    if ! cert_validation_error=$(openssl x509 -in "$cert_source/fullchain.pem" -text -noout 2>&1); then
+        log "Certificate validation failed for fullchain.pem"
+        log "OpenSSL error: $cert_validation_error"
         die "Source fullchain.pem is not a valid certificate"
     fi
     
     # Validate privkey.pem (try both RSA and ECDSA)
-    if ! openssl rsa -in "$cert_source/privkey.pem" -check -noout >/dev/null 2>&1 && \
-       ! openssl pkey -in "$cert_source/privkey.pem" -check -noout >/dev/null 2>&1; then
-        die "Source privkey.pem is not a valid private key"
+    local rsa_validation_error pkey_validation_error
+    if ! rsa_validation_error=$(openssl rsa -in "$cert_source/privkey.pem" -check -noout 2>&1); then
+        if ! pkey_validation_error=$(openssl pkey -in "$cert_source/privkey.pem" -check -noout 2>&1); then
+            log "Private key validation failed for privkey.pem"
+            log "OpenSSL RSA error: $rsa_validation_error"
+            log "OpenSSL PKEY error: $pkey_validation_error"
+            die "Source privkey.pem is not a valid private key"
+        fi
     fi
     
     # Validate that the certificate and private key match
     local cert_pubkey key_pubkey
 
-    cert_pubkey=$(openssl x509 -in "$cert_source/fullchain.pem" -pubkey -noout 2>/dev/null)
-    key_pubkey=$(openssl pkey -in "$cert_source/privkey.pem" -pubout 2>/dev/null)
+    if ! cert_pubkey=$(openssl x509 -in "$cert_source/fullchain.pem" -pubkey -noout 2>&1); then
+        log "Failed to extract public key from certificate"
+        log "OpenSSL error: $cert_pubkey"
+        die "Failed to extract public key from certificate"
+    fi
+    
+    if ! key_pubkey=$(openssl pkey -in "$cert_source/privkey.pem" -pubout 2>&1); then
+        log "Failed to extract public key from private key"
+        log "OpenSSL error: $key_pubkey"
+        die "Failed to extract public key from private key"
+    fi
     
     if [[ "$cert_pubkey" != "$key_pubkey" ]]; then
         die "Certificate and private key do not match"
@@ -223,19 +240,29 @@ update_certificate() {
     
     # Create new combined certificate file (we know it's valid)
     log "Combining validated fullchain.pem and privkey.pem..."
-    if cat "$cert_source/fullchain.pem" "$cert_source/privkey.pem" > "$CERT_FILE"; then
-        log "✓ Certificate files combined successfully"
-    else
+    local cat_error
+    if ! cat_error=$(cat "$cert_source/fullchain.pem" "$cert_source/privkey.pem" > "$CERT_FILE" 2>&1); then
+        log "Failed to combine certificate files"
+        log "Error: $cat_error"
         die "Failed to combine certificate files"
+    else
+        log "✓ Certificate files combined successfully"
     fi
     
     # Set proper permissions
-    if chown mongodb:mongodb "$CERT_FILE" && chmod 400 "$CERT_FILE"; then
-        log "✓ Certificate permissions set correctly"
-        log "Certificate updated: $CERT_FILE"
-    else
+    local chown_error chmod_error
+    if ! chown_error=$(chown mongodb:mongodb "$CERT_FILE" 2>&1); then
+        log "Failed to set certificate ownership: $chown_error"
         die "Failed to set certificate permissions"
     fi
+    
+    if ! chmod_error=$(chmod 400 "$CERT_FILE" 2>&1); then
+        log "Failed to set certificate permissions: $chmod_error"
+        die "Failed to set certificate permissions"
+    fi
+    
+    log "✓ Certificate permissions set correctly"
+    log "Certificate updated: $CERT_FILE"
 }
 
 restart_mongodb() {
@@ -266,7 +293,7 @@ restart_mongodb() {
     fi
 }
 
-validate_and_proceed() {
+validate_if_healthy() {
     local status="$1"
     
     # If there's an error, fail immediately
@@ -292,7 +319,6 @@ validate_and_proceed() {
                 
                 log "Replica set: $healthy/$total healthy (Primary: $is_primary)"
                 
-                # CRITICAL: All replicas must be healthy
                 if [[ $healthy -ne $total ]]; then
                     die "Not all replicas are healthy ($healthy/$total). Cannot proceed with certificate renewal."
                 fi
@@ -304,6 +330,13 @@ validate_and_proceed() {
             die "Unknown status: $status"
             ;;
     esac
+}
+
+validate_replicas_health(){
+    local health_status
+    health_status=$(check_status_and_stepdown_if_primary)
+    
+    validate_if_healthy "$health_status"
 }
 
 main() {
@@ -322,19 +355,19 @@ main() {
     log "Detected current node domain: $current_domain"
 
     if [[ "$current_domain" != "$RENEWED_DOMAIN" ]]; then
-        die "Renewed domain $RENEWED_DOMAIN is not the domain of the current node with domain $current_domain"
+        die "Renewed domain $RENEWED_DOMAIN does not match the current node domain $current_domain"
     fi
-    
-    # Check replica set health and prepare for restart
-    local health_status
-    health_status=$(check_and_prepare_replica_set)
-    
-    validate_and_proceed "$health_status"
+
+    # Check replica set health and step down if the node is the primary.
+    validate_replicas_health
     log "✓ All replicas healthy - ready to proceed with certificate renewal"
 
+    # Update cert file. This will not be applied until the node is restarted.
     update_certificate "$current_domain"
 
-    # Restart MongoDB now that it's safe
+    # Validate health again and restart.
+    validate_replicas_health
+    log "✓ All replicas healthy - ready to proceed with node restart"
     restart_mongodb
 
     log "Certificate renewal process completed successfully"
