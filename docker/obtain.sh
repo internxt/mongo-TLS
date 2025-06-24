@@ -10,7 +10,7 @@ if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
     echo "=== Certificate already exists for $DOMAIN ==="
 fi
 
-# We pass args to certbot
+# Any arg passed is also passed to certbot
 certbot "$@"
 
 # Check if certificates were created by certbot properly
@@ -21,12 +21,11 @@ if [ ! -f "$CERT_DIR/privkey.pem" ] || [ ! -f "$CERT_DIR/fullchain.pem" ]; then
 fi
 echo "=== Certificate obtained successfully ==="
 
-# Combinar private key y fullchain para MongoDB
+# Combine private key and fullchain for MongoDB
 echo "=== Creating combined certificate for MongoDB ==="
 OUTPUT_FILE="/output-certs/mongodb-cert-key-file.pem"
-# Create combined file (privkey + fullchain)
 cat "$CERT_DIR/privkey.pem" "$CERT_DIR/fullchain.pem" > "$OUTPUT_FILE"
-# Check if the combinated file was created successfully
+
 if [ ! -f "$OUTPUT_FILE" ]; then
     echo "ERROR: Failed to create combined certificate file"
     exit 1
@@ -36,13 +35,26 @@ fi
 CA_FILE="/output-certs/mongodb-ca.pem"
 cp "$CERT_DIR/chain.pem" "$CA_FILE"
 
+# Use the container's CA bundle (includes most recent all trusted CAs)
+if [ -f "/etc/ssl/certs/ca-certificates.crt" ]; then
+    echo "Using container's CA certificate bundle"
+    cp "/etc/ssl/certs/ca-certificates.crt" "$CA_FILE"
+else
+    echo "Container CA bundle not found, downloading Mozilla CA bundle..."
+    wget -O "$CA_FILE" https://curl.se/ca/cacert.pem
+    
+    # Add Let's Encrypt chain to ensure compatibility
+    echo "Appending Let's Encrypt chain to CA bundle"
+    cat "$CERT_DIR/chain.pem" >> "$CA_FILE"
+fi
+
 mkdir -p /output-certs/cert-and-keys
-# We copy all the certificates into output-certs
 cp "/etc/letsencrypt/live/$DOMAIN/"* "/output-certs/cert-and-keys"
 
-# We need to let host to read the folder and files
 chmod -R 644 "/output-certs/"
 chmod -R +X "/output-certs/"
+
+chmod -R 755 /etc/letsencrypt/
 
 echo "=== Certificate Information ==="
 echo "Domain: $DOMAIN"

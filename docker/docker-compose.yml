@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  certbot-renew:
+    build:
+      context: .
+      dockerfile: Dockerfile.renew
+    environment:
+      - DOMAIN=XXXXX
+    volumes:
+      - "./certs:/output-certs"
+      - "./backups:/backups"
+      - "./letsencrypt:/etc/letsencrypt"
+    ports:
+      - "80:80"
+    command: renew --cert-name "$DOMAIN" --standalone
+
+  certbot-obtain:
+    build:
+      context: .
+      dockerfile: Dockerfile.obtain
+    environment:
+      - DOMAIN=XXXXX
+    volumes:
+      - "./certs:/output-certs"
+      - "./letsencrypt:/etc/letsencrypt"
+    network_mode: "host"
+    command: certonly -d "$DOMAIN" --standalone --register-unsafely-without-email --agree-tos

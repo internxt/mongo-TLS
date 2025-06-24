@@ -8,7 +8,7 @@ fi
 
 echo "=== Starting certificate renewal for $DOMAIN ==="
 
-# Verificar que el certificado existe antes de intentar renovar
+# Verify that the certificate exists before attempting to renew
 CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
 if [ ! -d "$CERT_DIR" ]; then
     echo "ERROR: No existing certificate found for $DOMAIN"
@@ -26,10 +26,10 @@ fi
 CURRENT_EXPIRY=$(openssl x509 -in "$CERT_DIR/cert.pem" -noout -enddate | cut -d= -f2)
 echo "Certificate expires: $CURRENT_EXPIRY"
 
-# Crear backup antes de renovar
+# Create backup before renewing
 echo "=== Creating backup of current MongoDB certificates ==="
 
-# Usar fecha actual para el directorio de backup
+# Use current date for backup directory
 BACKUP_DATE=$(date +"%Y-%m-%d")
 BACKUP_TIME=$(date +"%H%M%S")
 BACKUP_DIR="/backups/$BACKUP_DATE"
@@ -63,18 +63,18 @@ else
     echo "=== No existing certificates found to backup ==="
 fi
 
-# Renovar certificado
 echo "=== Running certificate renewal ==="
+
+# Args passed to certbot command
 certbot "$@"
 
-# Verificar que la renovación fue exitosa
 if [ ! -f "$CERT_DIR/privkey.pem" ] || [ ! -f "$CERT_DIR/fullchain.pem" ]; then
     echo "ERROR: Certificate renewal failed - files not found"
     echo "You can restore from backup: $BACKUP_SUBDIR"
     exit 1
 fi
 
-# Verificar que el certificado realmente cambió
+# Verify that the certificate actually changed
 NEW_EXPIRY=$(openssl x509 -in "$CERT_DIR/cert.pem" -noout -enddate | cut -d= -f2)
 if [ "$CURRENT_EXPIRY" = "$NEW_EXPIRY" ]; then
     echo "WARNING: Certificate expiry date unchanged - renewal may not have been needed"
@@ -86,7 +86,6 @@ else
     echo "New expiry: $NEW_EXPIRY"
 fi
 
-# Post-procesamiento para MongoDB
 echo "=== Recreating MongoDB certificate files ==="
 OUTPUT_FILE="/output-certs/mongodb-cert-key-file.pem"
 
@@ -98,14 +97,26 @@ if [ ! -f "$OUTPUT_FILE" ]; then
     exit 1
 fi
 
+echo "=== Creating CA file for MongoDB ==="
 CA_FILE="/output-certs/mongodb-ca.pem"
-cp "$CERT_DIR/chain.pem" "$CA_FILE"
+
+# Use the ca-certification's CA bundle
+if [ -f "/etc/ssl/certs/ca-certificates.crt" ]; then
+    echo "Using container's CA certificate bundle"
+    cp "/etc/ssl/certs/ca-certificates.crt" "$CA_FILE"
+else
+    echo "Container CA bundle not found, downloading Mozilla CA bundle..."
+    wget -O "$CA_FILE" https://curl.se/ca/cacert.pem
+    
+    # Add Let's Encrypt chain to ensure compatibility
+    echo "Appending Let's Encrypt chain to CA bundle"
+    cat "$CERT_DIR/chain.pem" >> "$CA_FILE"
+fi
 
 mkdir -p /output-certs/cert-and-keys
 cp "$CERT_DIR/"* "/output-certs/cert-and-keys"
 
-chmod -R 644 "/output-certs/"
-chmod -R +X "/output-certs/"
+chmod -R 755 "/etc/letsencrypt/" "/output-certs/" "/backups"
 
 echo "=== Certificate Information ==="
 echo "Domain: $DOMAIN"
