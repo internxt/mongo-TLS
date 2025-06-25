@@ -1,4 +1,7 @@
 .env
-	docker/backups/
-	docker/certs/
-	docker/letsencrypt/
+docker/backups/
+docker/certs/
+docker/letsencrypt/
+node_modules/
+dist/
+logs/
