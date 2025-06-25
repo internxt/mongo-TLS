@@ -96,6 +96,8 @@ export class HealthCheckService {
                     throw new Error("No primary node found in replica set");
                 }
 
+                this.checkReplicaConnectivity(replicaStatus);
+
                 return {
                     success: true,
                     message:
@@ -144,6 +146,29 @@ export class HealthCheckService {
                     console.error("Error closing MongoDB client:", closeError);
                 }
             }
+        }
+    }
+
+    private static checkReplicaConnectivity(replicaStatus: any) {
+        const members = replicaStatus.members || [];
+        const disconnectedReplicas: string[] = [];
+
+        for (const member of members) {
+            if (member.self) continue;
+
+            if (member.health !== 1 || member.state === 8) {
+                disconnectedReplicas.push(
+                    `${member.name} (${member.stateStr})`
+                );
+            }
+        }
+
+        if (disconnectedReplicas.length > 0) {
+            throw new Error(
+                `Replica connectivity issues: ${disconnectedReplicas.join(
+                    ", "
+                )}`
+            );
         }
     }
 }
